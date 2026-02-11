@@ -11,7 +11,7 @@
 
 import * as p from "@clack/prompts";
 import { existsSync } from "fs";
-import { isAbsolute, resolve } from "path";
+import { dirname, isAbsolute, relative, resolve } from "path";
 import color from "picocolors";
 import {
   expandPath,
@@ -19,7 +19,6 @@ import {
   parseModelString,
   resolveConfig,
   resolveConfigWithProfile,
-  getRulesPromptWithProfile,
 } from "../lib/config.ts";
 import { analyzeFiles, cleanup } from "../lib/opencode.ts";
 import { listProfiles, profileExists } from "../lib/profiles.ts";
@@ -48,143 +47,167 @@ import { pickModel } from "./modelPicker.ts";
 /**
  * Display a single proposal
  */
-function displayProposal(proposal: FileMoveProposal, index: number): void {
+function displayProposal(proposal: FileMoveProposal, index: number, targetPath: string): void {
   const icon = getFileIcon(proposal.file.name);
   const size = color.dim(`(${formatFileSize(proposal.file.size)})`);
   const confidence = Math.round(proposal.category.confidence * 100);
-  const confidenceColor =
-    confidence >= 80
-      ? color.green
-      : confidence >= 50
-        ? color.yellow
-        : color.red;
+  let confidenceColor = color.red;
+  if (confidence >= 80) confidenceColor = color.green;
+  else if (confidence >= 50) confidenceColor = color.yellow;
 
   const conflictWarning = proposal.conflictExists
     ? color.yellow(" ⚠ exists")
     : "";
 
+  const relDest = relative(targetPath, dirname(proposal.destination));
+
   p.log.message(
     `${color.cyan(`[${index + 1}]`)} ${icon} ${color.bold(proposal.file.name)} ${size}${conflictWarning}\n` +
-      `    → ${color.dim(proposal.destination)}\n` +
-      `    ${getCategoryIcon(proposal.category.name)} ${proposal.category.name}${proposal.category.subcategory ? `/${proposal.category.subcategory}` : ""} ${confidenceColor(`${confidence}%`)}\n` +
-      `    ${color.dim(proposal.category.reasoning)}`,
+      `    → ${color.dim(relDest || ".")}\n` +
+      `    ${getCategoryIcon(proposal.category.name)} ${proposal.category.name}${proposal.category.subcategory ? `/${proposal.category.subcategory}` : ""} ${confidenceColor(`${confidence}%`)}` +
+      `  ${color.dim(proposal.category.reasoning)}`,
   );
+}
+
+interface TreeNode {
+  name: string;
+  children: Map<string, TreeNode>;
+  files: FileMoveProposal[];
 }
 
 /**
  * Display file tree for proposals
  */
-function displayFileTree(proposals: FileMoveProposal[]): void {
-  const tree = new Map<string, FileMoveProposal[]>();
+function displayFileTree(proposals: FileMoveProposal[], targetPath: string): void {
+  const root: TreeNode = { name: "", children: new Map(), files: [] };
 
   for (const prop of proposals) {
-    const parts = prop.destination.split(/[/\\]/);
-    let currentPath = "";
+    const relDir = relative(targetPath, dirname(prop.destination));
+    const parts = relDir ? relDir.split(/[/\\]/) : [];
 
-    for (let i = 0; i < parts.length; i++) {
-      const part = parts[i];
-      currentPath = currentPath ? `${currentPath}/${part}` : part;
-
-      if (i === parts.length - 1) {
-        if (!tree.has(currentPath)) {
-          tree.set(currentPath, []);
-        }
-        tree.get(currentPath)!.push(prop);
+    let node = root;
+    for (const part of parts) {
+      if (!node.children.has(part)) {
+        node.children.set(part, { name: part, children: new Map(), files: [] });
       }
+      node = node.children.get(part)!;
+    }
+    node.files.push(prop);
+  }
+
+  const lines: string[] = [];
+
+  function renderNode(node: TreeNode, prefix: string, isLast: boolean): void {
+    const connector = isLast ? "└─" : "├─";
+    const fileCount = countFiles(node);
+    lines.push(
+      `${prefix}${color.cyan(connector)} ${color.bold(node.name)}${color.dim(` (${fileCount})`)}`,
+    );
+
+    const childPrefix = prefix + (isLast ? "   " : "│  ");
+    const entries = Array.from(node.children.values());
+    const hasFiles = node.files.length > 0;
+
+    for (let i = 0; i < entries.length; i++) {
+      const isLastChild = i === entries.length - 1 && !hasFiles;
+      renderNode(entries[i], childPrefix, isLastChild);
+    }
+
+    for (let i = 0; i < node.files.length; i++) {
+      const file = node.files[i];
+      const isLastFile = i === node.files.length - 1;
+      const fileConnector = isLastFile ? "└─" : "├─";
+      const icon = getFileIcon(file.file.name);
+      const size = color.dim(`(${formatFileSize(file.file.size)})`);
+      const conflict = file.conflictExists ? color.yellow(" ⚠") : "";
+      lines.push(
+        `${childPrefix}${fileConnector} ${icon} ${file.file.name} ${size}${conflict}`,
+      );
     }
   }
 
-  const sortedPaths = Array.from(tree.keys()).sort();
-  const indent = "  ";
-
-  p.log.info(color.bold("Folder structure:"));
-  console.log();
-
-  for (const path of sortedPaths) {
-    const props = tree.get(path)!;
-    const depth = path.split(/[/\\]/).length - 1;
-
-    if (depth === 1) {
-      console.log(`${color.cyan("├─")} ${color.bold(path)}`);
-    } else {
-      const parentPath = path.split(/[/\\]/).slice(0, -1).join("/");
-      const parentProps = tree.get(parentPath);
-      if (!parentProps) {
-        console.log(`${"│ ".repeat(depth - 1)}├─ ${color.bold(path)}`);
-      }
-    }
-
-    for (const prop of props) {
-      const icon = getFileIcon(prop.file.name);
-      const size = color.dim(`(${formatFileSize(prop.file.size)})`);
-      console.log(`  ${"│ ".repeat(depth)}  ${icon} ${prop.file.name} ${size}`);
-    }
+  const topEntries = Array.from(root.children.values());
+  for (let i = 0; i < topEntries.length; i++) {
+    renderNode(topEntries[i], "", i === topEntries.length - 1);
   }
 
-  console.log();
+  for (const file of root.files) {
+    const icon = getFileIcon(file.file.name);
+    const size = color.dim(`(${formatFileSize(file.file.size)})`);
+    lines.push(`   ${icon} ${file.file.name} ${size}`);
+  }
+
+  p.log.info(color.bold("Folder structure:") + "\n" + lines.join("\n"));
+}
+
+function countFiles(node: TreeNode): number {
+  let count = node.files.length;
+  for (const child of node.children.values()) {
+    count += countFiles(child);
+  }
+  return count;
 }
 
 /**
  * Display all proposals grouped by category
  */
-function displayAllProposals(proposal: OrganizationProposal, useTreeView: boolean = false): void {
-  p.log.info(
-    color.bold(
-      `\nProposed organization for ${proposal.proposals.length} files:\n`,
-    ),
-  );
+function displayAllProposals(proposal: OrganizationProposal, targetPath: string, useTreeView: boolean = false): void {
+  p.log.info(`Proposed organization for ${color.bold(String(proposal.proposals.length))} files`);
 
   if (proposal.strategy) {
-    p.log.message(color.dim(`Strategy: ${proposal.strategy}\n`));
-  }
-
-  // Show tree view for large file sets
-  if (useTreeView) {
-    displayFileTree(proposal.proposals);
-  }
-
-  // Group by category
-  const byCategory = new Map<string, FileMoveProposal[]>();
-  for (const prop of proposal.proposals) {
-    const cat = prop.category.name;
-    if (!byCategory.has(cat)) {
-      byCategory.set(cat, []);
+    const maxWidth = Math.min(process.stdout.columns || 80, 72) - 4;
+    const words = proposal.strategy.split(/\s+/);
+    const wrappedLines: string[] = [];
+    let line = "";
+    for (const word of words) {
+      if (line && line.length + word.length + 1 > maxWidth) {
+        wrappedLines.push(line);
+        line = word;
+      } else {
+        line = line ? `${line} ${word}` : word;
+      }
     }
-    byCategory.get(cat)!.push(prop);
+    if (line) wrappedLines.push(line);
+    p.note(wrappedLines.join("\n"), "Strategy");
   }
 
-  if (!useTreeView) {
+  if (useTreeView) {
+    displayFileTree(proposal.proposals, targetPath);
+  } else {
+    const byCategory = new Map<string, FileMoveProposal[]>();
+    for (const prop of proposal.proposals) {
+      const cat = prop.category.name;
+      if (!byCategory.has(cat)) {
+        byCategory.set(cat, []);
+      }
+      byCategory.get(cat)!.push(prop);
+    }
+
     let index = 0;
     for (const [category, props] of byCategory) {
       p.log.info(
         `${getCategoryIcon(category)} ${color.bold(category)} (${props.length} files)`,
       );
       for (const prop of props) {
-        displayProposal(prop, index++);
+        displayProposal(prop, index++, targetPath);
       }
-      console.log();
     }
   }
 
-  // Show uncategorized files if any
   if (proposal.uncategorized.length > 0) {
-    p.log.warn(
-      color.yellow(
-        `\n${proposal.uncategorized.length} files could not be categorized:`,
-      ),
+    const uncatLines = proposal.uncategorized.map(
+      (file) => `  ${getFileIcon(file.name)} ${file.name}`,
     );
-    for (const file of proposal.uncategorized) {
-      p.log.message(`  ${getFileIcon(file.name)} ${file.name}`);
-    }
+    p.log.warn(
+      color.yellow(`${proposal.uncategorized.length} files could not be categorized:`) +
+        `\n${uncatLines.join("\n")}`,
+    );
   }
 
-  // Show conflict summary
-  const conflicts = proposal.proposals.filter((p) => p.conflictExists);
-  if (conflicts.length > 0) {
+  const conflictCount = proposal.proposals.filter((prop) => prop.conflictExists).length;
+  if (conflictCount > 0) {
     p.log.warn(
-      color.yellow(
-        `\n⚠ ${conflicts.length} files have conflicts (destination exists)`,
-      ),
+      color.yellow(`⚠ ${conflictCount} files have conflicts (destination exists)`),
     );
   }
 }
@@ -217,8 +240,18 @@ async function displayConflictDetails(proposal: FileMoveProposal): Promise<void>
     const timeDiff = sourceStats.mtime.getTime() - destStats.mtime.getTime();
 
     p.log.info(color.bold("Comparison:"));
-    p.log.message(`  Size difference: ${sizeDiff > 0 ? color.green("+" + formatFileSize(Math.abs(sizeDiff))) : sizeDiff < 0 ? color.red("-" + formatFileSize(Math.abs(sizeDiff))) : color.dim("Same size")}`);
-    p.log.message(`  Age difference: ${timeDiff > 0 ? color.green("Source is newer") : timeDiff < 0 ? color.yellow("Destination is newer") : color.dim("Same age")}`);
+
+    let sizeLabel: string;
+    if (sizeDiff > 0) sizeLabel = color.green("+" + formatFileSize(Math.abs(sizeDiff)));
+    else if (sizeDiff < 0) sizeLabel = color.red("-" + formatFileSize(Math.abs(sizeDiff)));
+    else sizeLabel = color.dim("Same size");
+    p.log.message(`  Size difference: ${sizeLabel}`);
+
+    let ageLabel: string;
+    if (timeDiff > 0) ageLabel = color.green("Source is newer");
+    else if (timeDiff < 0) ageLabel = color.yellow("Destination is newer");
+    else ageLabel = color.dim("Same age");
+    p.log.message(`  Age difference: ${ageLabel}`);
   }
 
   console.log();
@@ -230,10 +263,10 @@ async function displayConflictDetails(proposal: FileMoveProposal): Promise<void>
 async function selectFilesToMove(
   proposals: FileMoveProposal[],
 ): Promise<number[]> {
-  const options = proposals.map((p, i) => ({
+  const options = proposals.map((prop, i) => ({
     value: i,
-    label: p.file.name,
-    hint: `${p.category.name}${p.category.subcategory ? "/" + p.category.subcategory : ""} ${formatFileSize(p.file.size)}`,
+    label: prop.file.name,
+    hint: `${prop.category.name}${prop.category.subcategory ? "/" + prop.category.subcategory : ""} ${formatFileSize(prop.file.size)}`,
   }));
 
   const selected = await p.multiselect({
@@ -345,10 +378,10 @@ async function executeProposalsQuiet(
 async function viewProposalDetails(
   proposals: FileMoveProposal[],
 ): Promise<void> {
-  const options = proposals.map((p, i) => ({
+  const options = proposals.map((prop, i) => ({
     value: i,
-    label: `[${i + 1}] ${p.file.name}`,
-    hint: p.category.name,
+    label: `[${i + 1}] ${prop.file.name}`,
+    hint: prop.category.name,
   }));
 
   const selectedIndex = await p.select({
@@ -398,18 +431,18 @@ function resolvePath(inputPath: string): string {
  */
 function toJsonOutput(proposal: OrganizationProposal, results?: MoveResult[]): object {
   return {
-    proposals: proposal.proposals.map(p => ({
-      source: p.sourcePath,
-      destination: p.destination,
+    proposals: proposal.proposals.map(prop => ({
+      source: prop.sourcePath,
+      destination: prop.destination,
       file: {
-        name: p.file.name,
-        extension: p.file.extension,
-        size: p.file.size,
-        mimeType: p.file.mimeType,
-        hash: p.file.hash,
+        name: prop.file.name,
+        extension: prop.file.extension,
+        size: prop.file.size,
+        mimeType: prop.file.mimeType,
+        hash: prop.file.hash,
       },
-      category: p.category,
-      conflictExists: p.conflictExists,
+      category: prop.category,
+      conflictExists: prop.conflictExists,
     })),
     strategy: proposal.strategy,
     uncategorized: proposal.uncategorized.map(f => ({
@@ -876,10 +909,10 @@ export async function organizeCommand(options: OrganizeOptions): Promise<void> {
 
   // Display proposals
   const useTreeView = proposal.proposals.length >= 20;
-  displayAllProposals(proposal, useTreeView);
+  displayAllProposals(proposal, targetPath, useTreeView);
 
   // Check for conflicts
-  const conflicts = proposal.proposals.filter((p) => p.conflictExists);
+  const conflicts = proposal.proposals.filter((prop) => prop.conflictExists);
   const hasConflicts = conflicts.length > 0;
 
   // Dry run mode
@@ -963,10 +996,10 @@ export async function organizeCommand(options: OrganizeOptions): Promise<void> {
         case "resolve_conflicts": {
           const conflictIndex = await p.select({
             message: "Which conflict to view?",
-            options: conflicts.map((p, i) => ({
+            options: conflicts.map((c, i) => ({
               value: i,
-              label: p.file.name,
-              hint: formatFileSize(p.file.size),
+              label: c.file.name,
+              hint: formatFileSize(c.file.size),
             })),
           });
 
@@ -1036,7 +1069,7 @@ export async function organizeCommand(options: OrganizeOptions): Promise<void> {
               profileName: options.profile,
             });
             spinner!.stop("Analysis complete");
-            displayAllProposals(proposal);
+            displayAllProposals(proposal, targetPath);
           } catch (error: any) {
             spinner!.stop("Analysis failed");
             p.log.error(error.message);
@@ -1071,7 +1104,7 @@ export async function organizeCommand(options: OrganizeOptions): Promise<void> {
               profileName: options.profile,
             });
             spinner!.stop("Analysis complete");
-            displayAllProposals(proposal);
+            displayAllProposals(proposal, targetPath);
           } catch (error: any) {
             spinner!.stop("Analysis failed");
             p.log.error(error.message);
